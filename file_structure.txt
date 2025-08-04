@@ -1,0 +1,18 @@
+ToDoList/
+├── app.py                      <-- Your main Python Flask file
+├── todo_advanced.db            <-- This is the database file, automatically created by app.py
+├── templates/
+│   └── index.html              <-- Your main HTML file
+└── static/
+    ├── style.css               <-- Your CSS file for styling
+    ├── script.js               <-- Your JavaScript file for frontend logic
+    └── Funny_To_Do_List_Video_Request.mp4  <-- Your video file for the background
+pip install Flask
+pip install Flask-SQLAlchemy
+pip install Flask-Cors
+pip install Flask-Bcrypt
+pip install PyJWT
+pip install Flask-SocketIO
+pip install requests
+pip install python-engineio python-socketio
+set GEMINI_API_KEY="YOUR_ACTUAL_API_KEY"
