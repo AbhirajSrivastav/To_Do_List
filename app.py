@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 import json
 import requests
 import os
-from waitress import serve
+from waitress import serve # Import waitress for production deployment
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///todo_advanced.db'
@@ -24,6 +24,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # Gemini API configuration
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
+# Ensure GEMINI_API_URL is constructed safely, even if GEMINI_API_KEY is None initially
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=" + (GEMINI_API_KEY if GEMINI_API_KEY else '')
 
 # --- Database Models ---
@@ -101,9 +102,10 @@ def serve_index():
 @app.route('/parse-task', methods=['POST'])
 @token_required
 def parse_task_nlp(current_user):
+    # Check for API key at the point of use, not at startup
     if not GEMINI_API_KEY:
-        app.logger.error("Gemini API key is not set.")
-        return jsonify({"error": "AI parsing is not available. Please set the API key."}), 503
+        app.logger.error("Gemini API key is not set. AI parsing feature disabled.")
+        return jsonify({"error": "AI parsing is not available. Please set the GEMINI_API_KEY environment variable."}), 503
 
     task_text = request.json.get('text', '')
     if not task_text:
@@ -158,9 +160,10 @@ def parse_task_nlp(current_user):
     headers = {"Content-Type": "application/json"}
     try:
         response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()
+        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
         data = response.json()
         
+        # The API returns a JSON string within 'parts', so we need to parse it
         response_text = data['candidates'][0]['content']['parts'][0]['text']
         parsed_data = json.loads(response_text)
         
@@ -170,7 +173,7 @@ def parse_task_nlp(current_user):
         return jsonify({"error": "Failed to parse task with AI due to API request error."}), 500
     except (KeyError, json.JSONDecodeError) as e:
         app.logger.error(f"Error parsing Gemini API response: {e}, Response: {response.text}")
-        return jsonify({"error": "Failed to parse API response."}), 500
+        return jsonify({"error": "Failed to parse API response. Unexpected format."}), 500
 
 # --- Auth Routes ---
 @app.route('/register', methods=['POST'])
@@ -185,8 +188,8 @@ def register():
         db.session.add(new_user)
         db.session.commit()
         return jsonify({'message': 'User registered successfully!'}), 201
-    except IntegrityError:
-        db.session.rollback()
+    except IntegrityError: # Catches database unique constraint errors
+        db.session.rollback() # Rollback the transaction on error
         return jsonify({'message': 'An error occurred during registration. Please try again.'}), 500
 
 @app.route('/login', methods=['POST'])
@@ -196,6 +199,7 @@ def login():
     if not user or not bcrypt.check_password_hash(user.password_hash, data['password']):
         return jsonify({'message': 'Invalid credentials'}), 401
     
+    # Generate JWT token
     token = jwt.encode({'user_id': user.id, 'username': user.username, 'exp': datetime.utcnow() + timedelta(hours=24)},
                        app.config['SECRET_KEY'], algorithm="HS256")
     return jsonify({'token': token, 'username': user.username}), 200
@@ -215,23 +219,26 @@ def create_list(current_user):
     new_list = List(name=data['name'], user_id=current_user.id)
     db.session.add(new_list)
     db.session.commit()
-    # emit a real-time event to the user's personal room
+    # Emit a real-time event to the user's personal room (for list updates)
     socketio.emit('list_update', {'action': 'add', 'list': {'id': new_list.id, 'name': new_list.name}}, room=f'user_{current_user.id}')
     return jsonify({'message': 'List created!', 'id': new_list.id, 'name': new_list.name}), 201
 
 @app.route('/lists/<int:list_id>', methods=['DELETE'])
 @token_required
 def delete_list(current_user, list_id):
+    # Ensure the list belongs to the current user
     list_to_delete = List.query.filter_by(id=list_id, user_id=current_user.id).first_or_404()
     db.session.delete(list_to_delete)
     db.session.commit()
-    # emit a real-time event to the user's personal room
+    # Emit a real-time event to the user's personal room (for list updates)
     socketio.emit('list_update', {'action': 'delete', 'list_id': list_id}, room=f'user_{current_user.id}')
     return jsonify({'message': 'List deleted!'})
 
 @app.route('/lists/<int:list_id>/tasks', methods=['GET'])
 @token_required
 def get_tasks(current_user, list_id):
+    # Ensure the list belongs to the current user before fetching tasks
+    list_owner_check = List.query.filter_by(id=list_id, user_id=current_user.id).first_or_404()
     tasks = Task.query.filter_by(list_id=list_id).order_by(Task.position).all()
     output = [{'id': t.id, 'text': t.text, 'completed': t.completed, 'priority': t.priority, 'due_date': t.due_date, 'position': t.position} for t in tasks]
     return jsonify(output)
@@ -239,11 +246,14 @@ def get_tasks(current_user, list_id):
 @app.route('/lists/<int:list_id>/tasks', methods=['POST'])
 @token_required
 def add_task(current_user, list_id):
+    # Ensure the list belongs to the current user before adding tasks
+    list_owner_check = List.query.filter_by(id=list_id, user_id=current_user.id).first_or_404()
     data = request.get_json()
     new_task = Task(text=data['text'], list_id=list_id, priority=data.get('priority', 'Medium'), due_date=data.get('due_date'))
     db.session.add(new_task)
     db.session.commit()
-    emit('task_update', {'action': 'add', 'task': {'id': new_task.id, 'text': new_task.text}}, room=f'list_{list_id}')
+    # Emit a real-time event to the specific list's room
+    emit('task_update', {'action': 'add', 'task': {'id': new_task.id, 'text': new_task.text, 'completed': new_task.completed, 'priority': new_task.priority, 'due_date': new_task.due_date, 'position': new_task.position}}, room=f'list_{list_id}')
     return jsonify({'message': 'Task added!', 'id': new_task.id}), 201
 
 @app.route('/tasks/reorder', methods=['PUT'])
@@ -253,6 +263,9 @@ def reorder_tasks(current_user):
     list_id = data.get('list_id')
     task_ids = data.get('task_ids')
 
+    # Basic validation: ensure list belongs to user
+    list_owner_check = List.query.filter_by(id=list_id, user_id=current_user.id).first_or_404()
+
     tasks_to_update = Task.query.filter_by(list_id=list_id).all()
     task_map = {task.id: task for task in tasks_to_update}
 
@@ -261,12 +274,16 @@ def reorder_tasks(current_user):
             task_map[task_id].position = index
 
     db.session.commit()
+    # No real-time emit here, as fetchTasks is called on frontend after reorder
     return jsonify({'message': 'Tasks reordered!'})
 
 @app.route('/tasks/<int:task_id>', methods=['PUT'])
 @token_required
 def update_task(current_user, task_id):
     task = Task.query.get_or_404(task_id)
+    # Ensure task belongs to the current user's list
+    list_owner_check = List.query.filter_by(id=task.list_id, user_id=current_user.id).first_or_404()
+
     data = request.get_json()
     task.text = data.get('text', task.text)
     task.completed = data.get('completed', task.completed)
@@ -274,18 +291,28 @@ def update_task(current_user, task_id):
     task.due_date = data.get('due_date', task.due_date)
     db.session.commit()
 
-    emit('task_update', {'action': 'update', 'task': {'id': task.id, 'completed': task.completed, 'text': task.text}}, room=f'list_{task.list_id}')
+    emit('task_update', {'action': 'update', 'task': {'id': task.id, 'completed': task.completed, 'text': task.text, 'priority': task.priority, 'due_date': task.due_date, 'position': task.position}}, room=f'list_{task.list_id}')
     return jsonify({'message': 'Task updated!'})
 
 @app.route('/tasks/<int:task_id>', methods=['DELETE'])
 @token_required
 def delete_task(current_user, task_id):
     task = Task.query.get_or_404(task_id)
+    # Ensure task belongs to the current user's list
     list_id = task.list_id
+    list_owner_check = List.query.filter_by(id=list_id, user_id=current_user.id).first_or_404()
+    
     db.session.delete(task)
     db.session.commit()
     emit('task_update', {'action': 'delete', 'task_id': task_id}, room=f'list_{list_id}')
     return jsonify({'message': 'Task deleted!'})
 
+# --- Main entry point for running the app ---
 if __name__ == '__main__':
+    # For local development, use Flask's built-in server with SocketIO
+    # This is not for production deployment
     socketio.run(app, debug=True)
+
+# For production deployment, you would typically use a WSGI server like Gunicorn
+# The 'Procfile' on Render would look like:
+# web: python -m gunicorn --worker-class eventlet -w 1 -b 0.0.0.0:$PORT app:app
